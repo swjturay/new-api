@@ -463,7 +463,11 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
+	var excludedCredentials map[string]struct{}
+	if value, ok := common.GetContextKeyType[map[string]struct{}](c, constant.ContextKeyRelayRetryExcludedCredentials); ok {
+		excludedCredentials = value
+	}
+	key, index, newAPIError := channel.GetNextEnabledKeyExcluding(credentialExclusionForChannel(excludedCredentials, channel.Id))
 	if newAPIError != nil {
 		return newAPIError
 	}
@@ -500,6 +504,23 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		c.Set("bot_id", channel.Other)
 	}
 	return nil
+}
+
+func credentialExclusionForChannel(excluded map[string]struct{}, channelID int) map[int]struct{} {
+	if len(excluded) == 0 {
+		return nil
+	}
+	result := make(map[int]struct{})
+	prefix := fmt.Sprintf("%d:", channelID)
+	for identity := range excluded {
+		if !strings.HasPrefix(identity, prefix) {
+			continue
+		}
+		if index, err := strconv.Atoi(strings.TrimPrefix(identity, prefix)); err == nil {
+			result[index] = struct{}{}
+		}
+	}
+	return result
 }
 
 // extractModelNameFromGeminiPath 从 Gemini API URL 路径中提取模型名

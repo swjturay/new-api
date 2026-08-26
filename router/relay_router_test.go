@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -87,6 +88,59 @@ func TestListModelsSupportsOpenAIAndGeminiAuthentication(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRootAliasesStayOnRelayProtocolSurface(t *testing.T) {
+	setupRelayRouterTestDB(t)
+
+	user := model.User{
+		Username: "root-alias-user",
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    100,
+	}
+	require.NoError(t, model.DB.Create(&user).Error)
+	require.NoError(t, model.DB.Create(&model.Token{
+		UserId:         user.Id,
+		Key:            "rootaliaskey",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		UnlimitedQuota: true,
+	}).Error)
+
+	engine := gin.New()
+	SetRelayRouter(engine)
+	require.NoError(t, i18n.Init())
+
+	modelRecorder := httptest.NewRecorder()
+	modelRequest := httptest.NewRequest(http.MethodGet, "/models", nil)
+	modelRequest.Header.Set("Authorization", "Bearer rootaliaskey")
+	engine.ServeHTTP(modelRecorder, modelRequest)
+	require.Equal(t, http.StatusOK, modelRecorder.Code)
+	assert.Contains(t, modelRecorder.Header().Get("Content-Type"), "application/json")
+
+	responsesRecorder := httptest.NewRecorder()
+	responsesRequest := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5.6","input":[]}`))
+	responsesRequest.Header.Set("Authorization", "Bearer rootaliaskey")
+	responsesRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(responsesRecorder, responsesRequest)
+	assert.NotEqual(t, http.StatusOK, responsesRecorder.Code)
+	assert.Contains(t, responsesRecorder.Header().Get("Content-Type"), "application/json")
+	assert.NotContains(t, responsesRecorder.Body.String(), "<html")
+
+	wsRecorder := httptest.NewRecorder()
+	wsRequest := httptest.NewRequest(http.MethodGet, "/responses", nil)
+	wsRequest.Header.Set("Authorization", "Bearer rootaliaskey")
+	wsRequest.Header.Set("Upgrade", "websocket")
+	engine.ServeHTTP(wsRecorder, wsRequest)
+	require.Equal(t, http.StatusUpgradeRequired, wsRecorder.Code)
+	assert.Equal(t, "sse", wsRecorder.Header().Get("X-New-API-Transport"))
+
+	aliasRequest := httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader("{}"))
+	aliasContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	aliasContext.Request = aliasRequest
+	relayPathAlias("/v1/responses")(aliasContext)
+	assert.Equal(t, "/v1/responses", aliasRequest.URL.Path)
 }
 
 func setupRelayRouterTestDB(t *testing.T) {

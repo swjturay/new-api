@@ -117,6 +117,17 @@ func TestIsQwenThinkingBudgetModel(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesCompactionPolicyRoundTrip(t *testing.T) {
+	req := OpenAIResponsesRequest{Model: "gpt-5.6", CompactionPolicy: "strip"}
+	encoded, err := kitutil.Marshal(req)
+	require.NoError(t, err)
+	assert.Equal(t, "strip", gjson.GetBytes(encoded, "compaction_policy").String())
+
+	var compactReq OpenAIResponsesCompactionRequest
+	require.NoError(t, kitutil.Unmarshal([]byte(`{"model":"gpt-5.6","compaction_policy":"strip"}`), &compactReq))
+	assert.Equal(t, "strip", compactReq.CompactionPolicy)
+}
+
 func TestOpenAIResponsesRequestPreserveExplicitZeroValues(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-4.1",

@@ -93,6 +93,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			if common.GetContextKeyBool(c, constant.ContextKeyStreamTerminalSent) {
+				// The protocol adapter already emitted a terminal SSE event. A JSON
+				// body here would corrupt the stream and make the client report a
+				// transport disconnect.
+				return
+			}
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -181,17 +187,47 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
+	excludedChannels := make(map[int]struct{})
+	common.SetContextKey(c, constant.ContextKeyRelayRetryExcludedChannels, excludedChannels)
 	retryParam := &service.RetryParam{
-		Ctx:         c,
-		TokenGroup:  relayInfo.TokenGroup,
-		ModelName:   relayInfo.OriginModelName,
-		RequestPath: c.Request.URL.Path,
-		Retry:       common.GetPointer(0),
+		Ctx:                c,
+		TokenGroup:         relayInfo.TokenGroup,
+		ModelName:          relayInfo.OriginModelName,
+		RequestPath:        c.Request.URL.Path,
+		Retry:              common.GetPointer(0),
+		ExcludedChannelIDs: excludedChannels,
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	// RetryTimes remains the operator-facing baseline. For a request that has
+	// an eligible credential pool, the core relay loop may make one bounded
+	// attempt per credential even when RetryTimes is zero (the CPA deployment's
+	// normal setting). This is request-local and never changes global config.
+	retryBudget := common.RetryTimes + 1
+	credentialBudget := service.CountAvailableCredentialsForRequest(
+		c,
+		relayInfo.TokenGroup,
+		relayInfo.OriginModelName,
+		c.Request.URL.Path,
+		common.GetContextKeyString(c, constant.ContextKeyUserGroup),
+	)
+	if credentialBudget > retryBudget {
+		retryBudget = credentialBudget
+	}
+	if retryBudget < 1 {
+		retryBudget = 1
+	}
+	// A corrupt channel cache must not turn one request into an unbounded loop.
+	if retryBudget > 32 {
+		retryBudget = 32
+	}
+	compactionRecoveryAttempted := false
+	compactionBudgetExtended := false
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	for attempt := 0; attempt < retryBudget; attempt++ {
+		// RetryParam's value is a selection priority, not the total number of
+		// attempts. Keep its auto-group reset semantics intact while the loop
+		// counter supplies the bounded credential traversal budget.
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
@@ -238,15 +274,45 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
-		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
+		// A compaction credential mismatch gets one extra retry with
+		// compaction_policy=strip, independent of the global RetryTimes value.
+		if relayFormat == types.RelayFormatOpenAIResponsesCompaction &&
+			common.GetContextKeyBool(c, constant.ContextKeyResponsesCompactionStrip) &&
+			!compactionBudgetExtended {
+			retryBudget++
+			compactionBudgetExtended = true
+		}
+
+		remaining := retryBudget - attempt - 1
+		if remaining <= 0 || !shouldRetry(c, newAPIError, remaining) {
 			break
 		}
+		if relayFormat == types.RelayFormatOpenAIResponsesCompaction &&
+			common.GetContextKeyBool(c, constant.ContextKeyResponsesCompactionStrip) &&
+			!compactionRecoveryAttempted {
+			// Keep the same credential for the one-time strip retry. If that
+			// retry also fails, the normal credential traversal begins.
+			compactionRecoveryAttempted = true
+		} else {
+			markRelayRetryTarget(c, channel)
+		}
+		retryParam.IncreaseRetry()
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
 	if len(useChannel) > 1 {
 		retryLogStr := fmt.Sprintf("重试：%s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"))
 		logger.LogInfo(c, retryLogStr)
+	}
+	if newAPIError != nil && newAPIError.StatusCode == http.StatusTooManyRequests {
+		// Do not expose a provider's internal retry counter or credential names.
+		// At this point every request-local eligible credential has been tried.
+		newAPIError = types.NewOpenAIError(
+			errors.New("all eligible upstream credentials are currently unavailable"),
+			types.ErrorCodeChannelNoAvailableKey,
+			http.StatusTooManyRequests,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 	if newAPIError != nil {
 		gopool.Go(func() {
@@ -266,6 +332,45 @@ func addUsedChannel(c *gin.Context, channelId int) {
 	useChannel := c.GetStringSlice("use_channel")
 	useChannel = append(useChannel, fmt.Sprintf("%d", channelId))
 	c.Set("use_channel", useChannel)
+}
+
+// markRelayRetryTarget records request-local exclusions after a retryable
+// upstream failure. Multi-key channels exclude only the credential that was
+// used; single-key channels exclude the whole channel. Nothing is persisted
+// here, so a transient 429 cannot alter the shared account pool.
+func markRelayRetryTarget(c *gin.Context, channel *model.Channel) {
+	if c == nil || channel == nil {
+		return
+	}
+
+	excludedChannels, _ := common.GetContextKeyType[map[int]struct{}](c, constant.ContextKeyRelayRetryExcludedChannels)
+	if excludedChannels == nil {
+		excludedChannels = make(map[int]struct{})
+		common.SetContextKey(c, constant.ContextKeyRelayRetryExcludedChannels, excludedChannels)
+	}
+
+	if !channel.ChannelInfo.IsMultiKey {
+		excludedChannels[channel.Id] = struct{}{}
+		return
+	}
+
+	excludedCredentials, _ := common.GetContextKeyType[map[string]struct{}](c, constant.ContextKeyRelayRetryExcludedCredentials)
+	if excludedCredentials == nil {
+		excludedCredentials = make(map[string]struct{})
+		common.SetContextKey(c, constant.ContextKeyRelayRetryExcludedCredentials, excludedCredentials)
+	}
+	keyIndex := common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
+	excludedCredentials[fmt.Sprintf("%d:%d", channel.Id, keyIndex)] = struct{}{}
+	channelAttemptCount := 0
+	prefix := fmt.Sprintf("%d:", channel.Id)
+	for identity := range excludedCredentials {
+		if strings.HasPrefix(identity, prefix) {
+			channelAttemptCount++
+		}
+	}
+	if channelAttemptCount >= channel.EnabledKeyCount() {
+		excludedChannels[channel.Id] = struct{}{}
+	}
 }
 
 func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
@@ -316,7 +421,20 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		return nil, types.NewError(fmt.Errorf("获取分组 %s 下模型 %s 的可用渠道失败（retry）: %s", selectGroup, info.OriginModelName, err.Error()), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 	if channel == nil {
-		return nil, types.NewError(fmt.Errorf("分组 %s 下模型 %s 的可用渠道不存在（retry）", selectGroup, info.OriginModelName), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		// A model/ability mismatch is a client-visible capability error. Keep
+		// it distinct from a request-local 429 pool exhaustion below.
+		statusCode := http.StatusForbidden
+		errorCode := types.ErrorCodeGetChannelFailed
+		if info.LastError != nil && info.LastError.StatusCode == http.StatusTooManyRequests {
+			statusCode = http.StatusTooManyRequests
+			errorCode = types.ErrorCodeChannelNoAvailableKey
+		}
+		return nil, types.NewOpenAIError(
+			fmt.Errorf("no available upstream channel for model %s", info.OriginModelName),
+			errorCode,
+			statusCode,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 
 	info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
@@ -338,9 +456,6 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if types.IsChannelError(openaiErr) {
 		return true
 	}
-	if types.IsSkipRetryError(openaiErr) {
-		return false
-	}
 	if retryTimes <= 0 {
 		return false
 	}
@@ -352,6 +467,18 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 		return false
 	}
 	if code < 100 || code > 599 {
+		return true
+	}
+	// Credential-local rate limits must traverse the request-local pool even
+	// when an operator's generic status-code retry list omits 429. User quota
+	// failures are handled before this relay loop and never reach this branch.
+	if code == http.StatusTooManyRequests {
+		return true
+	}
+	if types.IsSkipRetryError(openaiErr) {
+		return false
+	}
+	if common.GetContextKeyBool(c, constant.ContextKeyResponsesCompactionStrip) {
 		return true
 	}
 	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {

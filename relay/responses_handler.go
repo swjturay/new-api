@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -46,6 +47,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			Input:                req.Input,
 			Instructions:         req.Instructions,
 			PreviousResponseID:   req.PreviousResponseID,
+			CompactionPolicy:     req.CompactionPolicy,
 			ParallelToolCalls:    req.ParallelToolCalls,
 			ServiceTier:          req.ServiceTier,
 			PromptCacheKey:       req.PromptCacheKey,
@@ -59,6 +61,11 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			http.StatusBadRequest,
 			types.ErrOptionWithSkipRetry(),
 		)
+	}
+	if common.GetContextKeyBool(c, constant.ContextKeyResponsesCompactionStrip) {
+		// Do not discard a client-provided policy, but make the recovery policy
+		// explicit on the retry that follows a credential mismatch.
+		responsesReq.CompactionPolicy = "strip"
 	}
 
 	request, err := common.DeepCopy(responsesReq)
@@ -131,6 +138,17 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 
 		if httpResp.StatusCode != http.StatusOK {
 			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+			if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
+				service.IsResponsesCompactionCredentialMismatch(newAPIError) {
+				if !common.GetContextKeyBool(c, constant.ContextKeyResponsesCompactionRecoveryUsed) {
+					common.SetContextKey(c, constant.ContextKeyResponsesCompactionStrip, true)
+					common.SetContextKey(c, constant.ContextKeyResponsesCompactionRecoveryUsed, true)
+					logger.LogWarn(c, "Responses compaction credential mismatch; retrying once with compaction_policy=strip")
+				}
+				// Never return the upstream credential identity or its retry advice to
+				// the end user. The controller may still retry by status code.
+				newAPIError = service.NewResponsesCompactionRecoveryError(httpResp.StatusCode)
+			}
 			// reset status code 重置状态码
 			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 			return newAPIError

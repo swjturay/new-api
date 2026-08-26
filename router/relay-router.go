@@ -1,6 +1,8 @@
 package router
 
 import (
+	"net/http"
+
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
@@ -78,6 +80,10 @@ func SetRelayRouter(router *gin.Engine) {
 		wsRouter.GET("/realtime", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIRealtime)
 		})
+		// Responses WebSocket is intentionally not implemented in this
+		// migration. Return a deterministic SSE-only response instead of letting
+		// the request fall through to the dashboard SPA.
+		relayV1Router.GET("/responses", responsesSSEOnly)
 	}
 	{
 		//http router
@@ -203,6 +209,79 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
 	}
+
+	// Sub2API's recommended Codex configuration uses the host root as its base
+	// URL, so clients append /responses (and sometimes /models) without /v1.
+	// Keep these aliases inside the normal relay middleware chain and normalize
+	// the request path before distribution and adapter selection.
+	registerRelayPathAlias(router, "/responses", "/v1/responses", types.RelayFormatOpenAIResponses)
+	registerRelayPathAlias(router, "/responses/compact", "/v1/responses/compact", types.RelayFormatOpenAIResponsesCompaction)
+	registerRelayPathAlias(router, "/messages", "/v1/messages", types.RelayFormatClaude)
+	registerRelayPathAlias(router, "/completions", "/v1/completions", types.RelayFormatOpenAI)
+	registerRelayPathAlias(router, "/chat/completions", "/v1/chat/completions", types.RelayFormatOpenAI)
+	registerRelayPathAlias(router, "/alpha/search", "/v1/alpha/search", types.RelayFormatOpenAIAlphaSearch)
+
+	rootResponses := router.Group("")
+	rootResponses.Use(relayPathAlias("/v1/responses"))
+	rootResponses.Use(middleware.RouteTag("relay"))
+	rootResponses.Use(middleware.SystemPerformanceCheck())
+	rootResponses.Use(middleware.TokenAuth())
+	rootResponses.GET("/responses", responsesSSEOnly)
+
+	rootModels := router.Group("")
+	rootModels.Use(relayPathAlias("/v1/models"))
+	rootModels.Use(middleware.RouteTag("relay"))
+	rootModels.Use(middleware.TokenAuth())
+	rootModels.GET("/models", func(c *gin.Context) {
+		switch {
+		case c.GetHeader("x-api-key") != "" && c.GetHeader("anthropic-version") != "":
+			controller.ListModels(c, constant.ChannelTypeAnthropic)
+		case c.GetHeader("x-goog-api-key") != "" || c.Query("key") != "":
+			controller.ListModels(c, constant.ChannelTypeGemini)
+		default:
+			controller.ListModels(c, constant.ChannelTypeOpenAI)
+		}
+	})
+}
+
+func registerRelayPathAlias(router *gin.Engine, aliasPath, canonicalPath string, relayFormat types.RelayFormat) {
+	alias := router.Group("")
+	alias.Use(relayPathAlias(canonicalPath))
+	alias.Use(middleware.RouteTag("relay"))
+	alias.Use(middleware.SystemPerformanceCheck())
+	alias.Use(middleware.TokenAuth())
+	alias.Use(middleware.ModelRequestRateLimit())
+	alias.Use(middleware.Distribute())
+	alias.POST(aliasPath, func(c *gin.Context) {
+		controller.Relay(c, relayFormat)
+	})
+}
+
+func relayPathAlias(canonicalPath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request != nil && c.Request.URL != nil {
+			c.Request.URL.Path = canonicalPath
+			if c.Request.URL.RawQuery != "" {
+				c.Request.RequestURI = canonicalPath + "?" + c.Request.URL.RawQuery
+			} else {
+				c.Request.RequestURI = canonicalPath
+			}
+		}
+		c.Next()
+	}
+}
+
+func responsesSSEOnly(c *gin.Context) {
+	c.Header("X-New-API-Transport", "sse")
+	c.Header("X-New-API-SSE-Endpoint", "/v1/responses")
+	c.JSON(http.StatusUpgradeRequired, gin.H{
+		"error": types.OpenAIError{
+			Message: "Responses WebSocket is not enabled; use HTTP streaming (SSE) at /v1/responses",
+			Type:    "invalid_request_error",
+			Param:   "",
+			Code:    "responses_websocket_disabled",
+		},
+	})
 }
 
 func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {

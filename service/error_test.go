@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -148,6 +149,43 @@ func TestRelayErrorHandlerKeepsInvalidJSONBodyInDebugLog(t *testing.T) {
 	require.NotNil(t, newAPIError)
 	require.NotContains(t, logBuffer.String(), "[truncated")
 	require.Contains(t, logBuffer.String(), body)
+}
+
+func TestIsResponsesCompactionCredentialMismatch(t *testing.T) {
+	t.Parallel()
+
+	assertions := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{
+			name: "codex credential mismatch",
+			text: "Codex compaction belongs to a different or unknown upstream credential. Retry on the original credential",
+			want: true,
+		},
+		{
+			name: "different error",
+			text: "compaction request is malformed",
+			want: false,
+		},
+	}
+	for _, assertion := range assertions {
+		assertion := assertion
+		t.Run(assertion.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, assertion.want, IsResponsesCompactionCredentialMismatch(errors.New(assertion.text)))
+		})
+	}
+}
+
+func TestNewResponsesCompactionRecoveryErrorHidesCredentialDetails(t *testing.T) {
+	t.Parallel()
+
+	err := NewResponsesCompactionRecoveryError(http.StatusConflict)
+	require.Equal(t, http.StatusConflict, err.StatusCode)
+	require.NotContains(t, strings.ToLower(err.Error()), "credential")
+	require.NotContains(t, strings.ToLower(err.ToOpenAIError().Message), "credential")
 }
 
 func withDebugEnabled(t *testing.T, enabled bool) {

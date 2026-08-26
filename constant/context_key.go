@@ -38,6 +38,24 @@ const (
 	ContextKeyChannelIsMultiKey        ContextKey = "channel_is_multi_key"
 	ContextKeyChannelMultiKeyIndex     ContextKey = "channel_multi_key_index"
 	ContextKeyChannelKey               ContextKey = "channel_key"
+	// ContextKeyRelayRetryExcludedChannels contains channel IDs that already
+	// failed before the first upstream byte and should not be selected again for
+	// this request. It is request-scoped; it never changes persisted channel
+	// configuration.
+	ContextKeyRelayRetryExcludedChannels ContextKey = "relay_retry_excluded_channels"
+	// ContextKeyRelayRetryExcludedCredentials contains credential identities
+	// (channel ID + key index) already attempted by the request.
+	ContextKeyRelayRetryExcludedCredentials ContextKey = "relay_retry_excluded_credentials"
+	// ContextKeyResponsesCompactionStrip asks the Responses adapter to retry a
+	// compaction request with compaction_policy=strip after an upstream
+	// credential-mismatch response.
+	ContextKeyResponsesCompactionStrip ContextKey = "responses_compaction_strip"
+	// ContextKeyResponsesCompactionRecoveryUsed prevents repeating the same
+	// compaction recovery indefinitely.
+	ContextKeyResponsesCompactionRecoveryUsed ContextKey = "responses_compaction_recovery_used"
+	// ContextKeyStreamTerminalSent indicates that a protocol-native terminal
+	// SSE event was emitted, so the controller must not append a JSON error body.
+	ContextKeyStreamTerminalSent ContextKey = "stream_terminal_sent"
 
 	ContextKeyAutoGroup           ContextKey = "auto_group"
 	ContextKeyAutoGroupIndex      ContextKey = "auto_group_index"

@@ -197,8 +197,19 @@ func (channel *Channel) GetKeys() []string {
 }
 
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+	return channel.GetNextEnabledKeyExcluding(nil)
+}
+
+// GetNextEnabledKeyExcluding selects an enabled credential while ignoring
+// credentials already attempted by the current request. The exclusion is
+// request-scoped and is intentionally kept separate from MultiKeyStatusList,
+// which represents persisted operational state.
+func (channel *Channel) GetNextEnabledKeyExcluding(excluded map[int]struct{}) (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
+		if _, ok := excluded[0]; ok {
+			return "", 0, types.NewError(errors.New("credential already attempted"), types.ErrorCodeChannelNoAvailableKey)
+		}
 		return channel.Key, 0, nil
 	}
 
@@ -229,6 +240,9 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	enabledIdx := make([]int, 0, len(keys))
 	for i := range keys {
 		if getStatus(i) == common.ChannelStatusEnabled {
+			if _, alreadyTried := excluded[i]; alreadyTried {
+				continue
+			}
 			enabledIdx = append(enabledIdx, i)
 		}
 	}
@@ -269,6 +283,9 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		for i := 0; i < len(keys); i++ {
 			idx := (start + i) % len(keys)
 			if getStatus(idx) == common.ChannelStatusEnabled {
+				if _, alreadyTried := excluded[idx]; alreadyTried {
+					continue
+				}
 				// update polling index for next call (point to the next position)
 				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
 				return keys[idx], idx, nil
@@ -280,6 +297,30 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		// Unknown mode, default to first enabled key (or original key string)
 		return keys[enabledIdx[0]], enabledIdx[0], nil
 	}
+}
+
+// EnabledKeyCount returns the number of credentials that are currently
+// enabled according to persisted channel state. It is used only to establish
+// a bounded per-request retry budget; it does not mutate channel state.
+func (channel *Channel) EnabledKeyCount() int {
+	if channel == nil {
+		return 0
+	}
+	if !channel.ChannelInfo.IsMultiKey {
+		if strings.TrimSpace(channel.Key) == "" {
+			return 0
+		}
+		return 1
+	}
+	keys := channel.GetKeys()
+	count := 0
+	for idx := range keys {
+		status, exists := channel.ChannelInfo.MultiKeyStatusList[idx]
+		if !exists || status == common.ChannelStatusEnabled {
+			count++
+		}
+	}
+	return count
 }
 
 func (channel *Channel) SaveChannelInfo() error {
