@@ -23,6 +23,10 @@ func SetRelayRouter(router *gin.Engine) {
 	modelsRouter.Use(middleware.TokenAuth())
 	{
 		modelsRouter.GET("", func(c *gin.Context) {
+			if c.Query("client_version") != "" {
+				controller.ListCodexModels(c)
+				return
+			}
 			switch {
 			case c.GetHeader("x-api-key") != "" && c.GetHeader("anthropic-version") != "":
 				controller.ListModels(c, constant.ChannelTypeAnthropic)
@@ -233,6 +237,10 @@ func SetRelayRouter(router *gin.Engine) {
 	rootModels.Use(middleware.RouteTag("relay"))
 	rootModels.Use(middleware.TokenAuth())
 	rootModels.GET("/models", func(c *gin.Context) {
+		if c.Query("client_version") != "" {
+			controller.ListCodexModels(c)
+			return
+		}
 		switch {
 		case c.GetHeader("x-api-key") != "" && c.GetHeader("anthropic-version") != "":
 			controller.ListModels(c, constant.ChannelTypeAnthropic)
@@ -242,6 +250,15 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.ListModels(c, constant.ChannelTypeOpenAI)
 		}
 	})
+
+	// Codex-compatible alias used by clients configured with a ChatGPT-style
+	// backend base URL. The handler still requires client_version to select the
+	// manifest response; without it, normal OpenAI model-list semantics apply.
+	codexModelsAlias := router.Group("/backend-api/codex")
+	codexModelsAlias.Use(middleware.RouteTag("relay"))
+	codexModelsAlias.Use(middleware.SystemPerformanceCheck())
+	codexModelsAlias.Use(middleware.TokenAuth())
+	codexModelsAlias.GET("/models", controller.ListCodexModels)
 }
 
 func registerRelayPathAlias(router *gin.Engine, aliasPath, canonicalPath string, relayFormat types.RelayFormat) {

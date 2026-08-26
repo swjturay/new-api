@@ -2,6 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -24,7 +28,155 @@ type codexClientVersionCache struct {
 	expiresAt time.Time
 }
 
+// CodexModelsManifest is the response envelope used by Codex model discovery.
+// The body is intentionally kept opaque so provider-specific capability fields
+// such as service_tiers survive the New API hop unchanged.
+type CodexModelsManifest struct {
+	StatusCode  int
+	Body        []byte
+	ETag        string
+	NotModified bool
+}
+
+func CodexModelsManifestETag(body []byte) string {
+	digest := sha256.Sum256(body)
+	return `"` + hex.EncodeToString(digest[:]) + `"`
+}
+
+// FilterCodexModelsManifest limits a complete Codex manifest to the models
+// visible through the authenticated New API group. The Codex envelope and all
+// per-model capability metadata are preserved.
+func FilterCodexModelsManifest(body []byte, allowedModels []string) ([]byte, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("decode Codex models manifest: %w", err)
+	}
+	if envelope == nil {
+		return nil, fmt.Errorf("decode Codex models manifest: expected object")
+	}
+	rawModels, ok := envelope["models"]
+	if !ok {
+		return nil, fmt.Errorf("decode Codex models manifest: missing models")
+	}
+	var models []json.RawMessage
+	if err := json.Unmarshal(rawModels, &models); err != nil {
+		return nil, fmt.Errorf("decode Codex models manifest models: %w", err)
+	}
+	allowed := make(map[string]struct{}, len(allowedModels))
+	for _, modelName := range allowedModels {
+		if modelName = strings.TrimSpace(modelName); modelName != "" {
+			allowed[modelName] = struct{}{}
+		}
+	}
+	filtered := make([]json.RawMessage, 0, len(models))
+	for _, rawModel := range models {
+		var descriptor struct {
+			Slug string `json:"slug"`
+		}
+		if err := json.Unmarshal(rawModel, &descriptor); err != nil {
+			return nil, fmt.Errorf("decode Codex model descriptor: %w", err)
+		}
+		if _, ok := allowed[strings.TrimSpace(descriptor.Slug)]; ok {
+			filtered = append(filtered, rawModel)
+		}
+	}
+	encodedModels, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, fmt.Errorf("encode filtered Codex models: %w", err)
+	}
+	envelope["models"] = encodedModels
+	filteredBody, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("encode filtered Codex manifest: %w", err)
+	}
+	return filteredBody, nil
+}
+
 var latestCodexClientVersion codexClientVersionCache
+
+const codexManifestCacheTTL = 30 * time.Second
+
+type codexManifestCacheEntry struct {
+	manifest  *CodexModelsManifest
+	expiresAt time.Time
+}
+
+var codexManifestCache = struct {
+	sync.Mutex
+	entries map[string]codexManifestCacheEntry
+	group   singleflight.Group
+}{entries: make(map[string]codexManifestCacheEntry)}
+
+func codexManifestCacheKey(baseURL, endpointPath, bearerToken, accountID, clientVersion string) string {
+	tokenDigest := sha256.Sum256([]byte(strings.TrimSpace(bearerToken)))
+	return strings.TrimRight(strings.TrimSpace(baseURL), "/") + "\x00" + endpointPath + "\x00" + hex.EncodeToString(tokenDigest[:]) + "\x00" + strings.TrimSpace(accountID) + "\x00" + clientVersion
+}
+
+// FetchCodexModelsManifestCached provides a short-lived, request-coalesced
+// manifest cache. If-None-Match is evaluated against the cached final body.
+func FetchCodexModelsManifestCached(
+	ctx context.Context,
+	client *http.Client,
+	baseURL string,
+	endpointPath string,
+	bearerToken string,
+	accountID string,
+	clientVersion string,
+	ifNoneMatch string,
+) (*CodexModelsManifest, error) {
+	key := codexManifestCacheKey(baseURL, endpointPath, bearerToken, accountID, clientVersion)
+	now := time.Now()
+	codexManifestCache.Lock()
+	entry, ok := codexManifestCache.entries[key]
+	codexManifestCache.Unlock()
+	if ok && now.Before(entry.expiresAt) {
+		return cloneCodexManifestForCondition(entry.manifest, ifNoneMatch), nil
+	}
+	value, err, _ := codexManifestCache.group.Do(key, func() (any, error) {
+		codexManifestCache.Lock()
+		entry, ok := codexManifestCache.entries[key]
+		codexManifestCache.Unlock()
+		if ok && time.Now().Before(entry.expiresAt) {
+			return entry.manifest, nil
+		}
+		manifest, err := FetchCodexModelsManifest(ctx, client, baseURL, endpointPath, bearerToken, accountID, clientVersion, "")
+		if err != nil {
+			return nil, err
+		}
+		if manifest.StatusCode >= http.StatusOK && manifest.StatusCode < http.StatusMultipleChoices {
+			codexManifestCache.Lock()
+			codexManifestCache.entries[key] = codexManifestCacheEntry{manifest: cloneCodexManifest(manifest), expiresAt: time.Now().Add(codexManifestCacheTTL)}
+			codexManifestCache.Unlock()
+		}
+		return manifest, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cloneCodexManifestForCondition(value.(*CodexModelsManifest), ifNoneMatch), nil
+}
+
+func cloneCodexManifest(manifest *CodexModelsManifest) *CodexModelsManifest {
+	if manifest == nil {
+		return nil
+	}
+	clone := *manifest
+	clone.Body = append([]byte(nil), manifest.Body...)
+	return &clone
+}
+
+func cloneCodexManifestForCondition(manifest *CodexModelsManifest, ifNoneMatch string) *CodexModelsManifest {
+	clone := cloneCodexManifest(manifest)
+	if clone == nil {
+		return nil
+	}
+	if strings.TrimSpace(ifNoneMatch) != "" && strings.TrimSpace(ifNoneMatch) == strings.TrimSpace(clone.ETag) {
+		clone.StatusCode = http.StatusNotModified
+		clone.NotModified = true
+		clone.Body = nil
+	}
+	return clone
+}
 
 func GetLatestCodexClientVersion(ctx context.Context, client *http.Client) (string, error) {
 	return latestCodexClientVersion.get(ctx, client, codexLatestReleaseURL, time.Now())
@@ -92,6 +244,76 @@ func fetchLatestCodexClientVersion(ctx context.Context, client *http.Client, rel
 	return version, nil
 }
 
+// FetchCodexModelsManifest fetches a Codex-compatible models manifest from an
+// upstream provider. endpointPath is explicit because CPA uses /v1/models,
+// while a direct Codex OAuth upstream uses /backend-api/codex/models.
+func FetchCodexModelsManifest(
+	ctx context.Context,
+	client *http.Client,
+	baseURL string,
+	endpointPath string,
+	bearerToken string,
+	accountID string,
+	clientVersion string,
+	ifNoneMatch string,
+) (*CodexModelsManifest, error) {
+	if client == nil {
+		return nil, fmt.Errorf("nil http client")
+	}
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	endpointPath = "/" + strings.TrimLeft(strings.TrimSpace(endpointPath), "/")
+	bearerToken = strings.TrimSpace(bearerToken)
+	accountID = strings.TrimSpace(accountID)
+	clientVersion = strings.TrimSpace(clientVersion)
+	if baseURL == "" {
+		return nil, fmt.Errorf("empty baseURL")
+	}
+	if bearerToken == "" {
+		return nil, fmt.Errorf("codex models: bearer token is required")
+	}
+	if clientVersion == "" {
+		return nil, fmt.Errorf("codex models: client_version is required")
+	}
+
+	modelsURL, err := url.Parse(baseURL + endpointPath)
+	if err != nil {
+		return nil, err
+	}
+	query := modelsURL.Query()
+	query.Set("client_version", clientVersion)
+	modelsURL.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+bearerToken)
+	if accountID != "" {
+		req.Header.Set("ChatGPT-Account-Id", accountID)
+	}
+	req.Header.Set("User-Agent", "codex-cli/"+clientVersion)
+	req.Header.Set("Accept", "application/json")
+	if ifNoneMatch = strings.TrimSpace(ifNoneMatch); ifNoneMatch != "" {
+		req.Header.Set("If-None-Match", ifNoneMatch)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &CodexModelsManifest{
+		StatusCode:  resp.StatusCode,
+		Body:        body,
+		ETag:        resp.Header.Get("ETag"),
+		NotModified: resp.StatusCode == http.StatusNotModified,
+	}, nil
+}
+
 func FetchCodexModels(
 	ctx context.Context,
 	client *http.Client,
@@ -123,35 +345,12 @@ func FetchCodexModels(
 		return 0, nil, fmt.Errorf("codex channel: client_version is required")
 	}
 
-	modelsURL, err := url.Parse(baseURL + "/backend-api/codex/models")
+	manifest, err := FetchCodexModelsManifest(ctx, client, baseURL, "/backend-api/codex/models", accessToken, accountID, clientVersion, "")
 	if err != nil {
 		return 0, nil, err
 	}
-	query := modelsURL.Query()
-	query.Set("client_version", clientVersion)
-	modelsURL.RawQuery = query.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL.String(), nil)
-	if err != nil {
-		return 0, nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("ChatGPT-Account-Id", accountID)
-	req.Header.Set("User-Agent", "codex-cli/"+clientVersion)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return resp.StatusCode, nil, err
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return resp.StatusCode, nil, nil
+	if manifest.StatusCode < http.StatusOK || manifest.StatusCode >= http.StatusMultipleChoices {
+		return manifest.StatusCode, nil, nil
 	}
 
 	var result struct {
@@ -159,8 +358,8 @@ func FetchCodexModels(
 			Slug string `json:"slug"`
 		} `json:"models"`
 	}
-	if err := common.Unmarshal(body, &result); err != nil {
-		return resp.StatusCode, nil, err
+	if err := common.Unmarshal(manifest.Body, &result); err != nil {
+		return manifest.StatusCode, nil, err
 	}
 
 	seen := make(map[string]struct{}, len(result.Models))
@@ -176,5 +375,5 @@ func FetchCodexModels(
 		seen[slug] = struct{}{}
 		models = append(models, slug)
 	}
-	return resp.StatusCode, models, nil
+	return manifest.StatusCode, models, nil
 }

@@ -206,7 +206,7 @@ func getModelListGroups(c *gin.Context) (modelListGroups, error) {
 	}, nil
 }
 
-func ListModels(c *gin.Context, modelType int) {
+func getVisibleModelNames(c *gin.Context, ownerGroups []string) []string {
 	acceptUnsetRatioModel := operation_setting.SelfUseModeEnabled
 	if !acceptUnsetRatioModel {
 		userId := c.GetInt("id")
@@ -217,7 +217,33 @@ func ListModels(c *gin.Context, modelType int) {
 			}
 		}
 	}
+	modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
+	var tokenModelLimit map[string]bool
+	if modelLimitEnable {
+		if value, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit); ok {
+			tokenModelLimit, _ = value.(map[string]bool)
+		}
+		if tokenModelLimit == nil {
+			tokenModelLimit = map[string]bool{}
+		}
+	}
+	visible := make([]string, 0)
+	for _, modelName := range service.GetGroupsEnabledModels(ownerGroups) {
+		if modelLimitEnable {
+			matchingName := ratio_setting.FormatMatchingModelName(modelName)
+			if !tokenModelLimit[modelName] && !tokenModelLimit[matchingName] {
+				continue
+			}
+		}
+		if !acceptUnsetRatioModel && !helper.HasModelBillingConfig(modelName) {
+			continue
+		}
+		visible = append(visible, modelName)
+	}
+	return visible
+}
 
+func ListModels(c *gin.Context, modelType int) {
 	userModelNames := make([]string, 0)
 	groups, err := getModelListGroups(c)
 	if err != nil {
@@ -228,30 +254,7 @@ func ListModels(c *gin.Context, modelType int) {
 		return
 	}
 	ownerGroups := groups.ownerGroups
-	modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
-	var tokenModelLimit map[string]bool
-	if modelLimitEnable {
-		s, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
-		if ok {
-			tokenModelLimit, _ = s.(map[string]bool)
-		}
-		if tokenModelLimit == nil {
-			tokenModelLimit = map[string]bool{}
-		}
-	}
-	models := service.GetGroupsEnabledModels(ownerGroups)
-	for _, modelName := range models {
-		if modelLimitEnable {
-			matchingName := ratio_setting.FormatMatchingModelName(modelName)
-			if !tokenModelLimit[modelName] && !tokenModelLimit[matchingName] {
-				continue
-			}
-		}
-		if !acceptUnsetRatioModel && !helper.HasModelBillingConfig(modelName) {
-			continue
-		}
-		userModelNames = append(userModelNames, modelName)
-	}
+	userModelNames = getVisibleModelNames(c, ownerGroups)
 
 	ownerByModel := map[string]string{}
 	if len(ownerGroups) > 0 {
@@ -304,6 +307,96 @@ func ListModels(c *gin.Context, modelType int) {
 			"object":  "list",
 		})
 	}
+}
+
+// ListCodexModels returns the Codex model manifest when the client negotiates
+// the Codex catalog with client_version. Ordinary model-list callers continue
+// to use ListModels and receive the OpenAI data envelope.
+func ListCodexModels(c *gin.Context) {
+	if strings.TrimSpace(c.Query("client_version")) == "" {
+		ListModels(c, constant.ChannelTypeOpenAI)
+		return
+	}
+	groups, err := getModelListGroups(c)
+	if err != nil || len(groups.ownerGroups) == 0 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"type": "upstream_error", "message": "no model group available"}})
+		return
+	}
+	visibleModels := getVisibleModelNames(c, groups.ownerGroups)
+	if len(visibleModels) == 0 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"type": "upstream_error", "message": "no models available"}})
+		return
+	}
+
+	var channel *model.Channel
+	for _, group := range groups.ownerGroups {
+		for _, modelName := range visibleModels {
+			candidate, selectErr := model.GetChannel(group, modelName, 0, "/v1/responses")
+			if selectErr == nil && candidate != nil {
+				channel = candidate
+				break
+			}
+		}
+		if channel != nil {
+			break
+		}
+	}
+	if channel == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"type": "upstream_error", "message": "no Codex manifest channel available"}})
+		return
+	}
+
+	manifest, err := service.FetchCodexChannelManifest(
+		c.Request.Context(),
+		channel,
+		c.Query("client_version"),
+		c.GetHeader("If-None-Match"),
+	)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": err.Error()}})
+		return
+	}
+	if manifest.StatusCode == http.StatusNotModified || manifest.NotModified {
+		if manifest.ETag != "" {
+			c.Header("ETag", manifest.ETag)
+		}
+		c.Status(http.StatusNotModified)
+		c.Writer.WriteHeaderNow()
+		return
+	}
+	if manifest.StatusCode < http.StatusOK || manifest.StatusCode >= http.StatusMultipleChoices {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": fmt.Sprintf("Codex manifest upstream status: %d", manifest.StatusCode)}})
+		return
+	}
+	filteredBody, err := service.FilterCodexModelsManifest(manifest.Body, visibleModels)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": err.Error()}})
+		return
+	}
+	manifest.ETag = service.CodexModelsManifestETag(filteredBody)
+	if etagMatches(c.GetHeader("If-None-Match"), manifest.ETag) {
+		c.Header("ETag", manifest.ETag)
+		c.Status(http.StatusNotModified)
+		c.Writer.WriteHeaderNow()
+		return
+	}
+	c.Header("ETag", manifest.ETag)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", filteredBody)
+}
+
+func etagMatches(ifNoneMatch, etag string) bool {
+	ifNoneMatch = strings.TrimSpace(ifNoneMatch)
+	etag = strings.TrimSpace(etag)
+	if ifNoneMatch == "" || etag == "" {
+		return false
+	}
+	if strings.HasPrefix(ifNoneMatch, "W/") {
+		ifNoneMatch = strings.TrimSpace(strings.TrimPrefix(ifNoneMatch, "W/"))
+	}
+	if strings.HasPrefix(etag, "W/") {
+		etag = strings.TrimSpace(strings.TrimPrefix(etag, "W/"))
+	}
+	return ifNoneMatch == etag || strings.Trim(ifNoneMatch, `"`) == strings.Trim(etag, `"`)
 }
 
 func ChannelListModels(c *gin.Context) {
