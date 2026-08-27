@@ -55,6 +55,7 @@ const quotaSchema = z.object({
   PreConsumedQuota: z.coerce.number().min(0),
   QuotaForInviter: z.coerce.number().min(0),
   QuotaForInvitee: z.coerce.number().min(0),
+  ReferralProgramEnabled: z.boolean(),
   TopUpLink: z.string(),
   general_setting: z.object({
     docs_link: z.string(),
@@ -129,6 +130,32 @@ export function QuotaSettingsSection({
           />
           <FormDirtyIndicator isDirty={isDirty} />
           <SettingsFormGrid>
+            <SettingsFormGridItem span='full'>
+              <FormField
+                control={form.control}
+                name='ReferralProgramEnabled'
+                render={({ field }) => (
+                  <SettingsSwitchItem>
+                    <SettingsSwitchContent>
+                      <FormLabel>{t('Referral Program')}</FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Allow referral links, invitation rewards, and reward transfers.'
+                        )}
+                      </FormDescription>
+                    </SettingsSwitchContent>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                        disabled={updateOption.isPending}
+                      />
+                    </FormControl>
+                  </SettingsSwitchItem>
+                )}
+              />
+            </SettingsFormGridItem>
+
             <FormField
               control={form.control}
               name='QuotaForNewUser'

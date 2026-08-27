@@ -59,3 +59,16 @@ export function saveAffiliateCode(code: string): void {
     console.error('Failed to save affiliate code:', error)
   }
 }
+
+/**
+ * Remove a previously captured affiliate code from localStorage
+ */
+export function clearAffiliateCode(): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.removeItem(STORAGE_KEYS.AFFILIATE)
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to clear affiliate code:', error)
+  }
+}

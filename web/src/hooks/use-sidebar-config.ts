@@ -290,11 +290,20 @@ export function useSidebarConfig(navGroups: NavGroup[]): NavGroup[] {
     // historical sidebar_modules value from a previous role would otherwise
     // hide admin entries for someone who has no in-product UI to restore
     // them.
-    if (auth?.user?.permissions?.sidebar_settings === false) {
+    if (
+      !canUsePersonalSidebarCustomization(
+        status?.user_sidebar_customization_enabled,
+        auth?.user?.permissions?.sidebar_settings
+      )
+    ) {
       return null
     }
     return parseUserSidebarConfig(auth?.user?.sidebar_modules)
-  }, [auth?.user?.permissions?.sidebar_settings, auth?.user?.sidebar_modules])
+  }, [
+    status?.user_sidebar_customization_enabled,
+    auth?.user?.permissions?.sidebar_settings,
+    auth?.user?.sidebar_modules,
+  ])
 
   const filteredNavGroups = useMemo(
     () =>
@@ -322,10 +331,19 @@ export function useIsSidebarModuleVisible(url: string): boolean {
   const adminConfig = parseSidebarConfig(
     status?.SidebarModulesAdmin as string | null | undefined
   )
-  const userConfig =
-    auth?.user?.permissions?.sidebar_settings === false
-      ? null
-      : parseUserSidebarConfig(auth?.user?.sidebar_modules)
+  const userConfig = canUsePersonalSidebarCustomization(
+    status?.user_sidebar_customization_enabled,
+    auth?.user?.permissions?.sidebar_settings
+  )
+    ? parseUserSidebarConfig(auth?.user?.sidebar_modules)
+    : null
 
   return isModuleEnabled(url, adminConfig, userConfig)
+}
+
+export function canUsePersonalSidebarCustomization(
+  featureEnabled: unknown,
+  permission: unknown
+): boolean {
+  return featureEnabled === true && permission === true
 }

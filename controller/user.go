@@ -260,8 +260,7 @@ func Register(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserExists)
 		return
 	}
-	affCode := user.AffCode // this code is the inviter's code, not the user's own code
-	inviterId, _ := model.GetUserIdByAffCode(affCode)
+	inviterId := resolveInviterID(user.AffCode)
 	cleanUser := model.User{
 		Username:    user.Username,
 		Password:    user.Password,
@@ -430,6 +429,9 @@ type TransferAffQuotaRequest struct {
 }
 
 func TransferAffQuota(c *gin.Context) {
+	if !requireBusinessFeature(c, common.ReferralProgramEnabled) {
+		return
+	}
 	if !requirePaymentCompliance(c) {
 		return
 	}
@@ -454,6 +456,9 @@ func TransferAffQuota(c *gin.Context) {
 }
 
 func GetAffCode(c *gin.Context) {
+	if !requireBusinessFeature(c, common.ReferralProgramEnabled) {
+		return
+	}
 	id := c.GetInt("id")
 	user, err := model.GetUserById(id, true)
 	if err != nil {
@@ -507,6 +512,27 @@ func GetSelf(c *gin.Context) {
 // administrator-only remarks.
 func buildSelfUserData(user *model.User) map[string]interface{} {
 	userSetting := user.GetSetting()
+	affCode := user.AffCode
+	affCount := user.AffCount
+	affQuota := user.AffQuota
+	affHistoryQuota := user.AffHistoryQuota
+	inviterID := user.InviterId
+	if !common.ReferralProgramEnabled {
+		affCode = ""
+		affCount = 0
+		affQuota = 0
+		affHistoryQuota = 0
+		inviterID = 0
+	}
+	sidebarModules := userSetting.SidebarModules
+	settingValue := user.Setting
+	if !common.UserSidebarCustomizationEnabled {
+		sidebarModules = ""
+		userSetting.SidebarModules = ""
+		if settingBytes, err := common.Marshal(userSetting); err == nil {
+			settingValue = string(settingBytes)
+		}
+	}
 	permissions := calculateUserPermissions(user.Role)
 	permissions["admin_permissions"] = authz.Capabilities(user.Id, user.Role)
 	return map[string]interface{}{
@@ -525,15 +551,15 @@ func buildSelfUserData(user *model.User) map[string]interface{} {
 		"quota":             user.Quota,
 		"used_quota":        user.UsedQuota,
 		"request_count":     user.RequestCount,
-		"aff_code":          user.AffCode,
-		"aff_count":         user.AffCount,
-		"aff_quota":         user.AffQuota,
-		"aff_history_quota": user.AffHistoryQuota,
-		"inviter_id":        user.InviterId,
+		"aff_code":          affCode,
+		"aff_count":         affCount,
+		"aff_quota":         affQuota,
+		"aff_history_quota": affHistoryQuota,
+		"inviter_id":        inviterID,
 		"linux_do_id":       user.LinuxDOId,
-		"setting":           user.Setting,
+		"setting":           settingValue,
 		"stripe_customer":   user.StripeCustomer,
-		"sidebar_modules":   userSetting.SidebarModules, // 正确提取sidebar_modules字段
+		"sidebar_modules":   sidebarModules,
 		"permissions":       permissions,
 	}
 }
@@ -541,6 +567,11 @@ func buildSelfUserData(user *model.User) map[string]interface{} {
 // 计算用户权限的辅助函数
 func calculateUserPermissions(userRole int) map[string]interface{} {
 	permissions := map[string]interface{}{}
+	if !common.UserSidebarCustomizationEnabled {
+		permissions["sidebar_settings"] = false
+		permissions["sidebar_modules"] = map[string]interface{}{}
+		return permissions
+	}
 
 	// 根据用户角色计算权限
 	if userRole == common.RoleRootUser {
@@ -789,6 +820,9 @@ func UpdateSelf(c *gin.Context) {
 
 	// 检查是否是用户设置更新请求 (sidebar_modules 或 language)
 	if sidebarModules, sidebarExists := requestData["sidebar_modules"]; sidebarExists {
+		if !requireBusinessFeature(c, common.UserSidebarCustomizationEnabled) {
+			return
+		}
 		userId := c.GetInt("id")
 		user, err := model.GetUserById(userId, false)
 		if err != nil {

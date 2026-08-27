@@ -83,6 +83,7 @@ const SITE_SECTIONS = [
         <SidebarModulesSection
           config={sidebarConfig}
           initialSerialized={sidebarSerialized}
+          customizationEnabled={settings.UserSidebarCustomizationEnabled}
         />
       )
     },

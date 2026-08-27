@@ -495,6 +495,10 @@ export const STATIC_I18N_KEYS = [
   'Reset to default configuration',
   'Sidebar Personal Settings',
   'Customize sidebar display content',
+  'Allow referral links, invitation rewards, and reward transfers.',
+  'Personal sidebar customization',
+  'Allow users to customize sidebar modules',
+  'When disabled, saved personal sidebar preferences are retained but ignored.',
   'Reset to Default',
 
   // Available models

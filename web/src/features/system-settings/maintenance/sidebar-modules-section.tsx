@@ -32,6 +32,7 @@ import { Switch } from '@/components/ui/switch'
 import {
   SettingsControlChildren,
   SettingsForm,
+  SettingsSwitchField,
   SettingsSwitchContent,
   SettingsControlGroup,
   SettingsSwitchItem,
@@ -48,6 +49,7 @@ import {
 type SidebarModulesSectionProps = {
   config: SidebarModulesAdminConfig
   initialSerialized: string
+  customizationEnabled: boolean
 }
 
 type SidebarFormValues = SidebarModulesAdminConfig
@@ -60,6 +62,7 @@ const toTitleCase = (value: string) =>
 export function SidebarModulesSection({
   config,
   initialSerialized,
+  customizationEnabled,
 }: SidebarModulesSectionProps) {
   const { t } = useTranslation()
   const updateOption = useUpdateOption()
@@ -185,90 +188,111 @@ export function SidebarModulesSection({
   const sections = Object.entries(config)
 
   return (
-    <SettingsSection title={t('Sidebar modules')}>
-      <Form {...form}>
-        <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>
-          <SettingsPageFormActions
-            onSave={form.handleSubmit(onSubmit)}
-            onReset={resetToDefault}
-            isSaving={updateOption.isPending}
-            resetLabel='Reset to default'
-            saveLabel='Save sidebar modules'
-          />
-          {sections.map(([sectionKey, sectionConfig]) => {
-            const sectionInfo = sectionMeta[sectionKey] ?? {
-              title: toTitleCase(sectionKey),
-              description: t('Custom sidebar section'),
-            }
-            const modules = Object.entries(sectionConfig).filter(
-              ([moduleKey]) => moduleKey !== 'enabled'
-            )
+    <>
+      <SettingsSection title={t('Personal sidebar customization')}>
+        <SettingsSwitchField
+          checked={customizationEnabled}
+          onCheckedChange={(checked) => {
+            void updateOption.mutateAsync({
+              key: 'UserSidebarCustomizationEnabled',
+              value: checked,
+            })
+          }}
+          label={t('Allow users to customize sidebar modules')}
+          description={t(
+            'When disabled, saved personal sidebar preferences are retained but ignored.'
+          )}
+          disabled={updateOption.isPending}
+        />
+      </SettingsSection>
 
-            return (
-              <SettingsControlGroup key={sectionKey}>
-                <FormField
-                  control={form.control}
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  name={`${sectionKey}.enabled` as any}
-                  render={({ field }) => (
-                    <SettingsSwitchItem>
-                      <SettingsSwitchContent>
-                        <FormLabel>{sectionInfo.title}</FormLabel>
-                        <FormDescription>
-                          {sectionInfo.description}
-                        </FormDescription>
-                      </SettingsSwitchContent>
-                      <FormControl>
-                        <Switch
-                          checked={Boolean(field.value)}
-                          onCheckedChange={field.onChange}
+      <SettingsSection title={t('Sidebar modules')}>
+        <Form {...form}>
+          <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>
+            <SettingsPageFormActions
+              onSave={form.handleSubmit(onSubmit)}
+              onReset={resetToDefault}
+              isSaving={updateOption.isPending}
+              resetLabel='Reset to default'
+              saveLabel='Save sidebar modules'
+            />
+            {sections.map(([sectionKey, sectionConfig]) => {
+              const sectionInfo = sectionMeta[sectionKey] ?? {
+                title: toTitleCase(sectionKey),
+                description: t('Custom sidebar section'),
+              }
+              const modules = Object.entries(sectionConfig).filter(
+                ([moduleKey]) => moduleKey !== 'enabled'
+              )
+
+              return (
+                <SettingsControlGroup key={sectionKey}>
+                  <FormField
+                    control={form.control}
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    name={`${sectionKey}.enabled` as any}
+                    render={({ field }) => (
+                      <SettingsSwitchItem>
+                        <SettingsSwitchContent>
+                          <FormLabel>{sectionInfo.title}</FormLabel>
+                          <FormDescription>
+                            {sectionInfo.description}
+                          </FormDescription>
+                        </SettingsSwitchContent>
+                        <FormControl>
+                          <Switch
+                            checked={Boolean(field.value)}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </SettingsSwitchItem>
+                    )}
+                  />
+
+                  <SettingsControlChildren className='grid gap-3 md:grid-cols-2'>
+                    {modules.map(([moduleKey]) => {
+                      const moduleInfo = moduleMeta[sectionKey]?.[
+                        moduleKey
+                      ] ?? {
+                        title: toTitleCase(moduleKey),
+                        description: t('Custom module'),
+                      }
+                      return (
+                        <FormField
+                          key={`${sectionKey}.${moduleKey}`}
+                          control={form.control}
+                          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                          name={`${sectionKey}.${moduleKey}` as any}
+                          render={({ field }) => (
+                            <SettingsSwitchItem className='py-2'>
+                              <SettingsSwitchContent>
+                                <FormLabel>{moduleInfo.title}</FormLabel>
+                                <FormDescription>
+                                  {moduleInfo.description}
+                                </FormDescription>
+                              </SettingsSwitchContent>
+                              <FormControl>
+                                <Switch
+                                  checked={Boolean(field.value)}
+                                  onCheckedChange={field.onChange}
+                                  disabled={
+                                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                                    !form.watch(`${sectionKey}.enabled` as any)
+                                  }
+                                />
+                              </FormControl>
+                            </SettingsSwitchItem>
+                          )}
                         />
-                      </FormControl>
-                    </SettingsSwitchItem>
-                  )}
-                />
-
-                <SettingsControlChildren className='grid gap-3 md:grid-cols-2'>
-                  {modules.map(([moduleKey]) => {
-                    const moduleInfo = moduleMeta[sectionKey]?.[moduleKey] ?? {
-                      title: toTitleCase(moduleKey),
-                      description: t('Custom module'),
-                    }
-                    return (
-                      <FormField
-                        key={`${sectionKey}.${moduleKey}`}
-                        control={form.control}
-                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                        name={`${sectionKey}.${moduleKey}` as any}
-                        render={({ field }) => (
-                          <SettingsSwitchItem className='py-2'>
-                            <SettingsSwitchContent>
-                              <FormLabel>{moduleInfo.title}</FormLabel>
-                              <FormDescription>
-                                {moduleInfo.description}
-                              </FormDescription>
-                            </SettingsSwitchContent>
-                            <FormControl>
-                              <Switch
-                                checked={Boolean(field.value)}
-                                onCheckedChange={field.onChange}
-                                disabled={
-                                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                                  !form.watch(`${sectionKey}.enabled` as any)
-                                }
-                              />
-                            </FormControl>
-                          </SettingsSwitchItem>
-                        )}
-                      />
-                    )
-                  })}
-                </SettingsControlChildren>
-              </SettingsControlGroup>
-            )
-          })}
-        </SettingsForm>
-      </Form>
-    </SettingsSection>
+                      )
+                    })}
+                  </SettingsControlChildren>
+                </SettingsControlGroup>
+              )
+            })}
+          </SettingsForm>
+        </Form>
+      </SettingsSection>
+    </>
   )
 }

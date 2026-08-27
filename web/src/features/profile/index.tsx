@@ -21,6 +21,7 @@ import {
   CardStaggerContainer,
   CardStaggerItem,
 } from '@/components/page-transition'
+import { canUsePersonalSidebarCustomization } from '@/hooks/use-sidebar-config'
 import { useStatus } from '@/hooks/use-status'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -45,7 +46,10 @@ export function Profile() {
     status?.turnstile_check && status?.turnstile_site_key
   )
   const turnstileSiteKey = status?.turnstile_site_key || ''
-  const canConfigureSidebar = permissions?.sidebar_settings !== false
+  const canConfigureSidebar = canUsePersonalSidebarCustomization(
+    status?.user_sidebar_customization_enabled,
+    permissions?.sidebar_settings
+  )
 
   return (
     <Main>
