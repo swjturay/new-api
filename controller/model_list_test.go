@@ -409,13 +409,19 @@ func TestListCodexModelsReturnsFilteredManifestAndSupportsETag(t *testing.T) {
 
 	baseURL := upstream.URL
 	channel := model.Channel{
-		Type:   constant.ChannelTypeOpenAI,
+		Type:   constant.ChannelTypeAdvancedCustom,
 		Key:    "cpa-key",
 		Name:   "cpa-codex",
 		Status: common.ChannelStatusEnabled,
 		Models: "gpt-5.6-sol",
 		Group:  "default",
 	}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{
+		AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
+			IncomingPath: dto.AdvancedCustomModelListPath,
+			UpstreamPath: dto.AdvancedCustomModelListPath,
+		}}},
+	})
 	channel.BaseURL = &baseURL
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "gpt-5.6-sol", ChannelId: channel.Id, Enabled: true}).Error)
@@ -454,6 +460,80 @@ func TestListCodexModelsReturnsFilteredManifestAndSupportsETag(t *testing.T) {
 	secondCtx.Set("id", 1009)
 	ListCodexModels(secondCtx)
 	require.Equal(t, http.StatusNotModified, secondRecorder.Code)
+}
+
+func TestListCodexModelsSkipsHigherPriorityChannelWithoutManifestCapability(t *testing.T) {
+	withSelfUseModeEnabled(t)
+	db := setupModelListControllerTestDB(t)
+
+	decoyCalls := 0
+	decoy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		decoyCalls++
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.6-sol"}]}`))
+	}))
+	defer decoy.Close()
+
+	manifestCalls := 0
+	manifest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		manifestCalls++
+		require.Equal(t, "/v1/models", r.URL.Path)
+		require.Equal(t, "0.149.0", r.URL.Query().Get("client_version"))
+		_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.6-sol","service_tiers":[{"id":"priority"}]}]}`))
+	}))
+	defer manifest.Close()
+
+	highPriority := int64(100)
+	decoyURL := decoy.URL
+	decoyChannel := model.Channel{
+		Type:     constant.ChannelTypeZhipu,
+		Key:      "decoy-key",
+		Name:     "higher-priority-non-manifest",
+		Status:   common.ChannelStatusEnabled,
+		Models:   "gpt-5.6-sol",
+		Group:    "default",
+		Priority: &highPriority,
+	}
+	decoyChannel.BaseURL = &decoyURL
+	require.NoError(t, db.Create(&decoyChannel).Error)
+	require.NoError(t, db.Create(&model.Ability{
+		Group: "default", Model: "gpt-5.6-sol", ChannelId: decoyChannel.Id,
+		Enabled: true, Priority: &highPriority,
+	}).Error)
+
+	manifestURL := manifest.URL
+	manifestChannel := model.Channel{
+		Type:   constant.ChannelTypeAdvancedCustom,
+		Key:    "manifest-key",
+		Name:   "codex-manifest-capable",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-5.6-sol",
+		Group:  "default",
+	}
+	manifestChannel.BaseURL = &manifestURL
+	manifestChannel.SetOtherSettings(dto.ChannelOtherSettings{
+		AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
+			IncomingPath: dto.AdvancedCustomModelListPath,
+			UpstreamPath: dto.AdvancedCustomModelListPath,
+		}}},
+	})
+	require.NoError(t, db.Create(&manifestChannel).Error)
+	require.NoError(t, db.Create(&model.Ability{
+		Group: "default", Model: "gpt-5.6-sol", ChannelId: manifestChannel.Id,
+		Enabled: true,
+	}).Error)
+	require.NoError(t, db.Create(&model.User{
+		Id: 1010, Username: "full-catalog-codex-user", Group: "default", Status: common.UserStatusEnabled,
+	}).Error)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/models?client_version=0.149.0", nil)
+	ctx.Set("id", 1010)
+	ListCodexModels(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Equal(t, 0, decoyCalls)
+	require.Equal(t, 1, manifestCalls)
 }
 
 func TestListModelsTokenLimitIncludesTieredBillingModel(t *testing.T) {

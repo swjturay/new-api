@@ -1106,6 +1106,29 @@ func GetChannelsByIds(ids []int) ([]*Channel, error) {
 	return channels, err
 }
 
+// GetEnabledChannelsForModels returns enabled channels that are reachable
+// through at least one enabled ability in the supplied group/model scope.
+// Discovery callers use this instead of normal weighted request selection
+// because capability negotiation must inspect channel capabilities, not pick
+// whichever inference channel happens to have the highest priority.
+func GetEnabledChannelsForModels(groups []string, modelNames []string) ([]*Channel, error) {
+	groups = normalizeLookupValues(groups)
+	modelNames = normalizeLookupValues(modelNames)
+	if len(groups) == 0 || len(modelNames) == 0 {
+		return []*Channel{}, nil
+	}
+
+	var channels []*Channel
+	err := DB.Table("channels").
+		Select("DISTINCT channels.*").
+		Joins("JOIN abilities ON abilities.channel_id = channels.id").
+		Where("channels.status = ? AND abilities.enabled = ?", common.ChannelStatusEnabled, true).
+		Where("abilities."+commonGroupCol+" IN ? AND abilities.model IN ?", groups, modelNames).
+		Order("channels.priority DESC, channels.id ASC").
+		Find(&channels).Error
+	return channels, err
+}
+
 func BatchSetChannelTag(ids []int, tag *string) error {
 	// 开启事务
 	tx := DB.Begin()

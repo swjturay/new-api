@@ -328,60 +328,62 @@ func ListCodexModels(c *gin.Context) {
 		return
 	}
 
-	var channel *model.Channel
-	for _, group := range groups.ownerGroups {
-		for _, modelName := range visibleModels {
-			candidate, selectErr := model.GetChannel(group, modelName, 0, "/v1/responses")
-			if selectErr == nil && candidate != nil {
-				channel = candidate
-				break
-			}
-		}
-		if channel != nil {
-			break
+	channels, err := model.GetEnabledChannelsForModels(groups.ownerGroups, visibleModels)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"type": "upstream_error", "message": "unable to resolve Codex manifest channels"}})
+		return
+	}
+	manifestChannels := make([]*model.Channel, 0, len(channels))
+	for _, channel := range channels {
+		if service.SupportsCodexModelsManifest(channel) {
+			manifestChannels = append(manifestChannels, channel)
 		}
 	}
-	if channel == nil {
+	if len(manifestChannels) == 0 {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"type": "upstream_error", "message": "no Codex manifest channel available"}})
 		return
 	}
 
-	manifest, err := service.FetchCodexChannelManifest(
-		c.Request.Context(),
-		channel,
-		c.Query("client_version"),
-		c.GetHeader("If-None-Match"),
-	)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": err.Error()}})
-		return
-	}
-	if manifest.StatusCode == http.StatusNotModified || manifest.NotModified {
-		if manifest.ETag != "" {
-			c.Header("ETag", manifest.ETag)
+	for _, channel := range manifestChannels {
+		manifest, fetchErr := service.FetchCodexChannelManifest(
+			c.Request.Context(),
+			channel,
+			c.Query("client_version"),
+			c.GetHeader("If-None-Match"),
+		)
+		if fetchErr != nil {
+			common.SysLog(fmt.Sprintf("Codex manifest channel #%d request failed: %v", channel.Id, fetchErr))
+			continue
 		}
-		c.Status(http.StatusNotModified)
-		c.Writer.WriteHeaderNow()
-		return
-	}
-	if manifest.StatusCode < http.StatusOK || manifest.StatusCode >= http.StatusMultipleChoices {
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": fmt.Sprintf("Codex manifest upstream status: %d", manifest.StatusCode)}})
-		return
-	}
-	filteredBody, err := service.FilterCodexModelsManifest(manifest.Body, visibleModels)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": err.Error()}})
-		return
-	}
-	manifest.ETag = service.CodexModelsManifestETag(filteredBody)
-	if etagMatches(c.GetHeader("If-None-Match"), manifest.ETag) {
+		if manifest.StatusCode == http.StatusNotModified || manifest.NotModified {
+			if manifest.ETag != "" {
+				c.Header("ETag", manifest.ETag)
+			}
+			c.Status(http.StatusNotModified)
+			c.Writer.WriteHeaderNow()
+			return
+		}
+		if manifest.StatusCode < http.StatusOK || manifest.StatusCode >= http.StatusMultipleChoices {
+			common.SysLog(fmt.Sprintf("Codex manifest channel #%d returned status %d", channel.Id, manifest.StatusCode))
+			continue
+		}
+		filteredBody, filterErr := service.FilterCodexModelsManifest(manifest.Body, visibleModels)
+		if filterErr != nil {
+			common.SysLog(fmt.Sprintf("Codex manifest channel #%d returned an incompatible envelope: %v", channel.Id, filterErr))
+			continue
+		}
+		manifest.ETag = service.CodexModelsManifestETag(filteredBody)
+		if etagMatches(c.GetHeader("If-None-Match"), manifest.ETag) {
+			c.Header("ETag", manifest.ETag)
+			c.Status(http.StatusNotModified)
+			c.Writer.WriteHeaderNow()
+			return
+		}
 		c.Header("ETag", manifest.ETag)
-		c.Status(http.StatusNotModified)
-		c.Writer.WriteHeaderNow()
+		c.Data(http.StatusOK, "application/json; charset=utf-8", filteredBody)
 		return
 	}
-	c.Header("ETag", manifest.ETag)
-	c.Data(http.StatusOK, "application/json; charset=utf-8", filteredBody)
+	c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "upstream_error", "message": "Codex model manifest temporarily unavailable"}})
 }
 
 func etagMatches(ifNoneMatch, etag string) bool {

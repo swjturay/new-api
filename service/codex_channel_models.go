@@ -38,6 +38,28 @@ func FetchCodexChannelModels(channel *model.Channel) ([]string, error) {
 	return fetchCodexChannelModels(ctx, channel, baseURL, client, clientVersion)
 }
 
+// SupportsCodexModelsManifest reports whether a channel explicitly exposes a
+// Codex-compatible model manifest. Ordinary inference channels are excluded:
+// their /v1/models endpoint commonly returns the OpenAI data envelope, which
+// is not interchangeable with the Codex models envelope.
+func SupportsCodexModelsManifest(channel *model.Channel) bool {
+	if channel == nil {
+		return false
+	}
+	if channel.Type == constant.ChannelTypeCodex {
+		return true
+	}
+	if channel.Type != constant.ChannelTypeAdvancedCustom {
+		return false
+	}
+	config := channel.GetOtherSettings().AdvancedCustom
+	if config == nil {
+		return false
+	}
+	_, ok := config.ModelListRoute()
+	return ok
+}
+
 // FetchCodexChannelManifest fetches the complete Codex discovery envelope for
 // a channel. Direct Codex OAuth channels use ChatGPT's dedicated manifest path;
 // OpenAI-compatible channels (including CPA Advanced Custom channels) use the
