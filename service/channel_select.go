@@ -11,12 +11,40 @@ import (
 )
 
 type RetryParam struct {
-	Ctx          *gin.Context
-	TokenGroup   string
-	ModelName    string
-	RequestPath  string
-	Retry        *int
-	resetNextTry bool
+	Ctx         *gin.Context
+	TokenGroup  string
+	ModelName   string
+	RequestPath string
+	Retry       *int
+	// ExcludedChannelIDs is scoped to a single request and prevents a failed
+	// single-key channel from being selected again during credential traversal.
+	ExcludedChannelIDs map[int]struct{}
+	resetNextTry       bool
+}
+
+// CountAvailableCredentials exposes the model-level bounded credential count
+// to the relay controller without leaking cache implementation details into
+// the request loop.
+func CountAvailableCredentials(group, modelName, requestPath string) int {
+	return model.CountAvailableCredentials(group, modelName, requestPath)
+}
+
+// CountAvailableCredentialsForRequest resolves the request's Auto group
+// snapshot before counting credentials. This keeps the retry budget aligned
+// with the same per-token group selection used by CacheGetRandomSatisfiedChannel.
+func CountAvailableCredentialsForRequest(c *gin.Context, group, modelName, requestPath, userGroup string) int {
+	if group != "auto" {
+		return CountAvailableCredentials(group, modelName, requestPath)
+	}
+	groups := GetRequestAutoGroups(c, userGroup)
+	count := 0
+	for _, autoGroup := range groups {
+		count += CountAvailableCredentials(autoGroup, modelName, requestPath)
+	}
+	if count <= 0 {
+		return 1
+	}
+	return count
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -115,7 +143,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-			channel, _ = model.GetRandomSatisfiedChannel(autoGroup, param.ModelName, priorityRetry, param.RequestPath)
+			channel, _ = model.GetRandomSatisfiedChannelExcluding(autoGroup, param.ModelName, priorityRetry, param.RequestPath, param.ExcludedChannelIDs)
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
@@ -153,7 +181,7 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			break
 		}
 	} else {
-		channel, err = model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, param.GetRetry(), param.RequestPath)
+		channel, err = model.GetRandomSatisfiedChannelExcluding(param.TokenGroup, param.ModelName, param.GetRetry(), param.RequestPath, param.ExcludedChannelIDs)
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}

@@ -13,6 +13,7 @@ type OpenAIResponsesCompactionRequest struct {
 	Input              json.RawMessage `json:"input,omitempty"`
 	Instructions       json.RawMessage `json:"instructions,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	CompactionPolicy   string          `json:"compaction_policy,omitempty"`
 	// Codex compact request parity:
 	// https://github.com/openai/codex/commit/53d59722268dde82fb93c1f37964ce196c2a86d7
 	// https://github.com/openai/codex/commit/5d6f23a27bf9c90709af527a7108c1c2eadf5123

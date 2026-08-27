@@ -392,6 +392,70 @@ func TestListModelsUsesAdvancedCustomEndpointTypesFromPricingCache(t *testing.T)
 	}, payload.Data[0].SupportedEndpointTypes)
 }
 
+func TestListCodexModelsReturnsFilteredManifestAndSupportsETag(t *testing.T) {
+	withSelfUseModeEnabled(t)
+	db := setupModelListControllerTestDB(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/models", r.URL.Path)
+		require.Equal(t, "0.149.0", r.URL.Query().Get("client_version"))
+		require.Equal(t, "Bearer cpa-key", r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"models":[
+            {"slug":"gpt-5.6-sol","service_tiers":[{"id":"priority","name":"Fast"}],"additional_speed_tiers":["fast"]},
+            {"slug":"hidden-model","service_tiers":[]}
+        ]}`))
+	}))
+	defer upstream.Close()
+
+	baseURL := upstream.URL
+	channel := model.Channel{
+		Type:   constant.ChannelTypeOpenAI,
+		Key:    "cpa-key",
+		Name:   "cpa-codex",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-5.6-sol",
+		Group:  "default",
+	}
+	channel.BaseURL = &baseURL
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "gpt-5.6-sol", ChannelId: channel.Id, Enabled: true}).Error)
+	require.NoError(t, db.Create(&model.User{Id: 1009, Username: "codex-manifest-user", Group: "default", Status: common.UserStatusEnabled}).Error)
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.149.0", nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = request
+	ctx.Set("id", 1009)
+	ListCodexModels(ctx)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	etag := recorder.Header().Get("ETag")
+	require.NotEmpty(t, etag)
+	var payload struct {
+		Models []struct {
+			Slug         string `json:"slug"`
+			ServiceTiers []struct {
+				ID string `json:"id"`
+			} `json:"service_tiers"`
+			AdditionalSpeedTiers []string `json:"additional_speed_tiers"`
+		} `json:"models"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &payload))
+	require.Len(t, payload.Models, 1)
+	require.Equal(t, "gpt-5.6-sol", payload.Models[0].Slug)
+	require.Equal(t, "priority", payload.Models[0].ServiceTiers[0].ID)
+	require.Equal(t, []string{"fast"}, payload.Models[0].AdditionalSpeedTiers)
+
+	secondRequest := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.149.0", nil)
+	secondRequest.Header.Set("If-None-Match", etag)
+	secondRecorder := httptest.NewRecorder()
+	secondCtx, _ := gin.CreateTestContext(secondRecorder)
+	secondCtx.Request = secondRequest
+	secondCtx.Set("id", 1009)
+	ListCodexModels(secondCtx)
+	require.Equal(t, http.StatusNotModified, secondRecorder.Code)
+}
+
 func TestListModelsTokenLimitIncludesTieredBillingModel(t *testing.T) {
 	withSelfUseModeDisabled(t)
 	withTieredBillingConfig(t, map[string]string{

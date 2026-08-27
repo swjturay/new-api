@@ -38,6 +38,41 @@ func FetchCodexChannelModels(channel *model.Channel) ([]string, error) {
 	return fetchCodexChannelModels(ctx, channel, baseURL, client, clientVersion)
 }
 
+// FetchCodexChannelManifest fetches the complete Codex discovery envelope for
+// a channel. Direct Codex OAuth channels use ChatGPT's dedicated manifest path;
+// OpenAI-compatible channels (including CPA Advanced Custom channels) use the
+// upstream /v1/models path with client_version negotiation.
+func FetchCodexChannelManifest(
+	ctx context.Context,
+	channel *model.Channel,
+	clientVersion string,
+	ifNoneMatch string,
+) (*CodexModelsManifest, error) {
+	if channel == nil {
+		return nil, fmt.Errorf("nil channel")
+	}
+	baseURL := strings.TrimSpace(channel.GetBaseURL())
+	if baseURL == "" {
+		return nil, fmt.Errorf("empty channel base URL")
+	}
+	keys := channel.GetKeys()
+	if len(keys) == 0 || strings.TrimSpace(keys[0]) == "" {
+		return nil, fmt.Errorf("channel key is required")
+	}
+	client, err := GetHttpClientWithProxy(channel.GetSetting().Proxy)
+	if err != nil {
+		return nil, err
+	}
+	if channel.Type == constant.ChannelTypeCodex {
+		oauthKey, err := parseCodexOAuthKey(strings.TrimSpace(keys[0]))
+		if err != nil {
+			return nil, err
+		}
+		return FetchCodexModelsManifestCached(ctx, client, baseURL, "/backend-api/codex/models", oauthKey.AccessToken, oauthKey.AccountID, clientVersion, ifNoneMatch)
+	}
+	return FetchCodexModelsManifestCached(ctx, client, baseURL, "/v1/models", strings.TrimSpace(keys[0]), "", clientVersion, ifNoneMatch)
+}
+
 func fetchCodexChannelModels(
 	ctx context.Context,
 	channel *model.Channel,

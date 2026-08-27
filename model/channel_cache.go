@@ -112,9 +112,17 @@ func SyncChannelCache(frequency int) {
 }
 
 func GetRandomSatisfiedChannel(group string, model string, retry int, requestPath string) (*Channel, error) {
+	return GetRandomSatisfiedChannelExcluding(group, model, retry, requestPath, nil)
+}
+
+// GetRandomSatisfiedChannelExcluding is the request-retry aware variant of
+// GetRandomSatisfiedChannel. Exclusions are used only for the current request
+// so a transient upstream failure cannot make a healthy channel disappear from
+// the shared cache.
+func GetRandomSatisfiedChannelExcluding(group string, model string, retry int, requestPath string, excluded map[int]struct{}) (*Channel, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
-		return GetChannel(group, model, retry, requestPath)
+		return GetChannelExcluding(group, model, retry, requestPath, excluded)
 	}
 
 	channelSyncLock.RLock()
@@ -122,11 +130,13 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 
 	// First, try to find channels with the exact model name.
 	channels := filterChannelsByRequestPathAndModel(group2model2channels[group][model], requestPath, model)
+	channels = excludeChannelIDs(channels, excluded)
 
 	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.FormatMatchingModelName(model)
 		channels = filterChannelsByRequestPathAndModel(group2model2channels[group][normalizedModel], requestPath, model)
+		channels = excludeChannelIDs(channels, excluded)
 	}
 
 	if len(channels) == 0 {
@@ -206,6 +216,81 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, requestPat
 	}
 	// return null if no channel is not found
 	return nil, errors.New("channel not found")
+}
+
+func excludeChannelIDs(channels []int, excluded map[int]struct{}) []int {
+	if len(excluded) == 0 || len(channels) == 0 {
+		return channels
+	}
+	filtered := make([]int, 0, len(channels))
+	for _, channelID := range channels {
+		if _, skip := excluded[channelID]; skip {
+			continue
+		}
+		filtered = append(filtered, channelID)
+	}
+	return filtered
+}
+
+// CountAvailableCredentials returns a bounded retry budget for the currently
+// eligible channel pool. A multi-key channel contributes each enabled key;
+// single-key channels contribute one. The result is used only to allow a
+// request to traverse a pool after a credential-local 429/5xx response.
+func CountAvailableCredentials(group, modelName, requestPath string) int {
+	if common.MemoryCacheEnabled {
+		channelSyncLock.RLock()
+		defer channelSyncLock.RUnlock()
+		channels := filterChannelsByRequestPathAndModel(group2model2channels[group][modelName], requestPath, modelName)
+		if len(channels) == 0 {
+			normalized := ratio_setting.FormatMatchingModelName(modelName)
+			channels = filterChannelsByRequestPathAndModel(group2model2channels[group][normalized], requestPath, modelName)
+		}
+		count := 0
+		for _, channelID := range channels {
+			if channel, ok := channelsIDM[channelID]; ok {
+				count += channel.EnabledKeyCount()
+			}
+		}
+		if count > 0 {
+			return count
+		}
+		return 1
+	}
+
+	var abilities []Ability
+	if err := DB.Where(commonGroupCol+" = ? AND model = ? AND enabled = ?", group, modelName, true).Find(&abilities).Error; err != nil {
+		return 1
+	}
+	if len(abilities) == 0 {
+		normalized := ratio_setting.FormatMatchingModelName(modelName)
+		if err := DB.Where(commonGroupCol+" = ? AND model = ? AND enabled = ?", group, normalized, true).Find(&abilities).Error; err != nil {
+			return 1
+		}
+	}
+	if len(abilities) == 0 {
+		return 1
+	}
+	ids := make([]int, 0, len(abilities))
+	seen := make(map[int]struct{}, len(abilities))
+	for _, ability := range abilities {
+		if _, ok := seen[ability.ChannelId]; ok {
+			continue
+		}
+		seen[ability.ChannelId] = struct{}{}
+		ids = append(ids, ability.ChannelId)
+	}
+	var channels []*Channel
+	if err := DB.Where("id IN ? AND status = ?", ids, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
+		return 1
+	}
+	count := 0
+	for _, channel := range channels {
+		count += channel.EnabledKeyCount()
+	}
+	if count <= 0 {
+		return 1
+	}
+	return count
 }
 
 // filterChannelsByRequestPathAndModel restricts candidates by request path and

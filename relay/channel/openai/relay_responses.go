@@ -1,12 +1,14 @@
 package openai
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -84,6 +86,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	var responseTextBuilder strings.Builder
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
+	terminalSeen := false
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
@@ -97,6 +100,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		sendResponsesStreamData(c, streamResponse, data)
 		switch streamResponse.Type {
 		case "response.completed", "response.done":
+			terminalSeen = true
 			if streamResponse.Response != nil {
 				if streamResponse.Response.Usage != nil {
 					if streamResponse.Response.Usage.InputTokens != 0 {
@@ -132,6 +136,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				imageCommitted = true
 			}
 		case "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+			terminalSeen = true
 			if !imageCommitted {
 				imageCounter.Reset()
 				imageCounter.Commit(info)
@@ -157,6 +162,44 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		}
 	})
+
+	if !terminalSeen {
+		// A provider/proxy may close an SSE stream after emitting deltas but
+		// before response.completed. Retrying after bytes have been sent would
+		// duplicate the assistant output, so finish with a protocol-native
+		// response.failed event instead of appending a JSON error to the stream.
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			common.SetContextKey(c, constant.ContextKeyStreamTerminalSent, true)
+			return nil, types.NewOpenAIError(
+				errors.New("Responses stream ended after the client disconnected"),
+				types.ErrorCodeBadResponse,
+				http.StatusBadGateway,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		failedResponse := &dto.OpenAIResponsesResponse{
+			ID:     helper.GetResponseID(c),
+			Object: "response",
+			Model:  info.UpstreamModelName,
+			Status: []byte(`"failed"`),
+			Error: types.OpenAIError{
+				Message: "upstream Responses stream ended before completion",
+				Type:    "server_error",
+				Code:    "stream_incomplete",
+			},
+		}
+		if payload, err := common.Marshal(failedResponse); err == nil {
+			_ = helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "response.failed", Response: failedResponse}, string(payload))
+			helper.Done(c)
+			common.SetContextKey(c, constant.ContextKeyStreamTerminalSent, true)
+		}
+		return nil, types.NewOpenAIError(
+			errors.New("upstream Responses stream ended before completion"),
+			types.ErrorCodeBadResponse,
+			http.StatusBadGateway,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
 
 	if usage.CompletionTokens == 0 {
 		// 计算输出文本的 token 数量

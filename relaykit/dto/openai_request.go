@@ -875,7 +875,11 @@ type OpenAIResponsesRequest struct {
 	FrequencyPenalty   json.RawMessage `json:"frequency_penalty,omitempty"`
 	PresencePenalty    json.RawMessage `json:"presence_penalty,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
-	Reasoning          *Reasoning      `json:"reasoning,omitempty"`
+	// CompactionPolicy is accepted by Codex-compatible Responses upstreams.
+	// The recovery path sets the documented "strip" policy after a credential
+	// mismatch without changing the rest of the request shape.
+	CompactionPolicy string     `json:"compaction_policy,omitempty"`
+	Reasoning        *Reasoning `json:"reasoning,omitempty"`
 	// ServiceTier specifies upstream service level and may affect billing.
 	// This field is filtered by default and can be enabled via channel setting allow_service_tier.
 	ServiceTier string `json:"service_tier,omitempty"`

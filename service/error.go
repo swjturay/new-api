@@ -137,6 +137,34 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	return
 }
 
+// IsResponsesCompactionCredentialMismatch identifies the stable part of the
+// Codex Responses compaction error. The upstream has changed the surrounding
+// wording over time, so matching is deliberately case-insensitive and based
+// on the semantic markers rather than the full message.
+func IsResponsesCompactionCredentialMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "compaction") &&
+		(strings.Contains(lower, "different or unknown upstream credential") ||
+			strings.Contains(lower, "original credential"))
+}
+
+// NewResponsesCompactionRecoveryError returns a user-safe error for the
+// one-time compaction recovery path. The upstream credential detail is kept
+// out of the client response; callers may log the typed condition separately.
+func NewResponsesCompactionRecoveryError(statusCode int) *types.NewAPIError {
+	if statusCode < 400 || statusCode > 599 {
+		statusCode = http.StatusBadGateway
+	}
+	return types.NewOpenAIError(
+		errors.New("upstream Responses compaction could not be completed"),
+		types.ErrorCodeBadResponse,
+		statusCode,
+	)
+}
+
 func ResetStatusCode(newApiErr *types.NewAPIError, statusCodeMappingStr string) {
 	if newApiErr == nil {
 		return
