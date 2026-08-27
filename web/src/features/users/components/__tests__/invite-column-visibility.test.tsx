@@ -37,7 +37,23 @@ function hasInviteInfoColumn(
   return columns.some((column) => column.id === 'invite_info')
 }
 
+function hasEmailColumn(columns: ReturnType<typeof useUsersColumns>): boolean {
+  return columns.some(
+    (column) =>
+      column.id === 'email' ||
+      ('accessorKey' in column && column.accessorKey === 'email')
+  )
+}
+
 describe('user-list referral columns', () => {
+  test('always includes the email column for administrators', () => {
+    featureStatus.referralProgramEnabled = false
+
+    const { result } = renderHook(() => useUsersColumns())
+
+    expect(hasEmailColumn(result.current)).toBe(true)
+  })
+
   test('omits invite information while the referral program is disabled', () => {
     featureStatus.referralProgramEnabled = false
 
