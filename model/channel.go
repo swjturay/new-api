@@ -1118,15 +1118,34 @@ func GetEnabledChannelsForModels(groups []string, modelNames []string) ([]*Chann
 		return []*Channel{}, nil
 	}
 
-	var channels []*Channel
-	err := DB.Table("channels").
-		Select("DISTINCT channels.*").
-		Joins("JOIN abilities ON abilities.channel_id = channels.id").
+	var channelIDs []int
+	err := DB.Table("abilities").
+		Select("abilities.channel_id").
+		Joins("JOIN channels ON channels.id = abilities.channel_id").
 		Where("channels.status = ? AND abilities.enabled = ?", common.ChannelStatusEnabled, true).
 		Where("abilities."+commonGroupCol+" IN ? AND abilities.model IN ?", groups, modelNames).
-		Order("channels.priority DESC, channels.id ASC").
-		Find(&channels).Error
-	return channels, err
+		Group("abilities.channel_id, channels.priority").
+		Order("channels.priority DESC, abilities.channel_id ASC").
+		Pluck("abilities.channel_id", &channelIDs).Error
+	if err != nil || len(channelIDs) == 0 {
+		return []*Channel{}, err
+	}
+
+	channels, err := GetChannelsByIds(channelIDs)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int]*Channel, len(channels))
+	for _, channel := range channels {
+		byID[channel.Id] = channel
+	}
+	ordered := make([]*Channel, 0, len(channelIDs))
+	for _, channelID := range channelIDs {
+		if channel, ok := byID[channelID]; ok {
+			ordered = append(ordered, channel)
+		}
+	}
+	return ordered, nil
 }
 
 func BatchSetChannelTag(ids []int, tag *string) error {
