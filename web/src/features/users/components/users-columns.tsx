@@ -30,6 +30,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { useStatus } from '@/hooks/use-status'
 import { formatQuota, formatTimestamp } from '@/lib/format'
 
 import {
@@ -44,7 +45,9 @@ import { UserQuotaCell } from './user-quota-cell'
 
 export function useUsersColumns(): ColumnDef<User>[] {
   const { t } = useTranslation()
-  return [
+  const { status } = useStatus()
+  const referralProgramEnabled = status?.referral_program_enabled === true
+  const columns: ColumnDef<User>[] = [
     {
       id: 'select',
       header: ({ table }) => (
@@ -327,4 +330,8 @@ export function useUsersColumns(): ColumnDef<User>[] {
       meta: { pinned: 'right' as const },
     },
   ]
+
+  return referralProgramEnabled
+    ? columns
+    : columns.filter((column) => column.id !== 'invite_info')
 }
